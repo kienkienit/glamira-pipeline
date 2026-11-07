@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local data: raw sample, IP database, exports, and crawl logs
+data/
+
+# Large or sensitive extracts that must stay off GitHub
+*.bson
+*.bin
+*.csv
+*.jsonl
+*.log
