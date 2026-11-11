@@ -1,6 +1,7 @@
 import csv
 import random
 import re
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,6 +84,19 @@ DOMAINS = [
     "www.glamira.com.ph",
     "www.glamira.vn",
 ]
+REMAINING_DOMAINS = [
+    "www.glamira.com.au",
+    "www.glamira.ca",
+    "www.glamira.ie",
+    "www.glamira.co.za",
+    "www.glamira.co.nz",
+    "www.glamira.sg",
+    "www.glamira.in",
+    "www.glamira.ae",
+    "www.glamira.com.mt",
+    "www.glamira.africa",
+]
+FOUR_DOMAIN_SWEEP_AFTER = "2026-11-06T17:02:00+00:00"
 
 
 def good_category(category):
@@ -170,41 +184,20 @@ def export_csv(products):
                 writer.writerow(doc)
 
 
-def main():
-    database = MongoClient("mongodb://127.0.0.1:27017").countly
-    database.products.create_index("product_id", unique=True, name="product_id_1")
-    database.product_catalog_misses.create_index("product_id", unique=True, name="product_id_1")
-    removed = database.products.delete_many(
-        {"$expr": {"$in": [{"$toLower": {"$ifNull": ["$category", ""]}}, list(HOME)]}}
-    ).deleted_count
-    print(f"removed {removed} products whose category was a homepage label", flush=True)
-    done = {
+def load_done(database):
+    return {
         doc["product_id"]
         for doc in database.products.find({}, {"product_id": 1, "product_name": 1, "category": 1})
         if doc.get("product_name") and (doc.get("category") is None or good_category(doc.get("category")))
     }
-    exhausted = {
-        doc["product_id"]
-        for doc in database.product_catalog_misses.find({}, {"product_id": 1})
-    }
-    print(f"{len(done)} products already saved. Loading the missing ids.", flush=True)
-    missing = []
-    for doc in database.product_urls.aggregate(
-        [{"$group": {"_id": "$product_id"}}],
-        allowDiskUse=True,
-    ):
-        product_id = doc["_id"]
-        if product_id not in done and product_id not in exhausted:
-            missing.append(product_id)
-    print(f"{len(missing)} ids left. Trying .com, .co.uk, .com.ph, then .vn.", flush=True)
 
-    session = requests.Session()
+
+def crawl_ids(database, session, product_ids, domains, done, miss_reason):
     tried = 0
-    for product_id in missing:
+    for product_id in product_ids:
         tried += 1
         found = False
-        skip_reason = "not_found"
-        for domain in DOMAINS:
+        for domain in domains:
             url = catalog_url(domain, product_id)
             try:
                 response = fetch(session, url)
@@ -225,6 +218,7 @@ def main():
                         f"{len(done)} {product_id} | {row['product_name']} | {row['category'] or 'null'} | {domain}",
                         flush=True,
                     )
+                    database.product_catalog_misses.delete_one({"product_id": product_id})
                     time.sleep(random.uniform(1.5, 4.2))
                     break
             except Exception as error:
@@ -236,7 +230,7 @@ def main():
                 {"product_id": product_id},
                 {"$set": {
                     "product_id": product_id,
-                    "reason": skip_reason,
+                    "reason": miss_reason,
                     "checked_at": datetime.now(timezone.utc).isoformat(),
                 }},
                 upsert=True,
@@ -244,6 +238,61 @@ def main():
             if tried % 50 == 0:
                 print(f"saved {len(done)} | tried {tried} | not found {product_id}", flush=True)
 
+
+def main():
+    database = MongoClient("mongodb://127.0.0.1:27017").countly
+    database.products.create_index("product_id", unique=True, name="product_id_1")
+    database.product_catalog_misses.create_index("product_id", unique=True, name="product_id_1")
+    removed = database.products.delete_many(
+        {"$expr": {"$in": [{"$toLower": {"$ifNull": ["$category", ""]}}, list(HOME)]}}
+    ).deleted_count
+    print(f"removed {removed} products whose category was a homepage label", flush=True)
+    done = load_done(database)
+    session = requests.Session()
+
+    if "--remaining-domains" in sys.argv:
+        database.product_catalog_misses.update_many(
+            {"checked_at": {"$lt": FOUR_DOMAIN_SWEEP_AFTER}},
+            {"$set": {"reason": "not_found_all_domains"}},
+        )
+        pending = [
+            doc["product_id"]
+            for doc in database.product_catalog_misses.find(
+                {"reason": {"$ne": "not_found_all_domains"}},
+                {"product_id": 1},
+            )
+        ]
+        print(
+            f"{len(pending)} ids were only checked on 4 domains. "
+            f"Trying {len(REMAINING_DOMAINS)} other stores.",
+            flush=True,
+        )
+        crawl_ids(database, session, pending, REMAINING_DOMAINS, done, "not_found_all_domains")
+        export_csv(database.products)
+        print(f"with a product name: {len(done)}", flush=True)
+        print(
+            f"category null: {database.products.count_documents({'product_name': {'$nin': [None, '']}, 'category': None})}",
+            flush=True,
+        )
+        print(f"not found: {database.product_catalog_misses.count_documents({})}", flush=True)
+        print(f"CSV: {CSV_PATH.resolve()}", flush=True)
+        return
+
+    exhausted = {
+        doc["product_id"]
+        for doc in database.product_catalog_misses.find({}, {"product_id": 1})
+    }
+    print(f"{len(done)} products already saved. Loading the missing ids.", flush=True)
+    missing = []
+    for doc in database.product_urls.aggregate(
+        [{"$group": {"_id": "$product_id"}}],
+        allowDiskUse=True,
+    ):
+        product_id = doc["_id"]
+        if product_id not in done and product_id not in exhausted:
+            missing.append(product_id)
+    print(f"{len(missing)} ids left. Trying .com, .co.uk, .com.ph, then .vn.", flush=True)
+    crawl_ids(database, session, missing, DOMAINS, done, "not_found")
     export_csv(database.products)
     print(f"with a product name: {len(done)}", flush=True)
     print(
